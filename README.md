@@ -6,8 +6,9 @@ and fits each group with the ACTS Kalman fitter of k4ActsTracking (`ACTSTracking
 propagator, material, field, Kalman update and edm4hep conversion as the CKF; unlike the CKF, it does not reject hits
 by a chi2 cut. The purpose of this is to isolate detector resolutions from reconstruction algorithm performance.
 
-Inputs: `MergedTrackerHits`, `MergedTrackerHitsRelations`, an MCParticle collection (`MCParticles`, or the overlay's
-copy, e.g. `NewMCParticles`). Outputs: `TruthTracks`, and `TruthTrackRelations` (one `TrackMCParticleLink` per track,
+Inputs: `MergedTrackerHits`, `MergedTrackerHitsRelations`. Each hit's MCParticle is read from its SimTrackerHit, so
+the output links point to `MCParticles` without overlay and to the overlay's copy (e.g. `NewMCParticles`) with
+overlay; with overlay the BIB hits have no particle object behind them and are skipped. Outputs: `TruthTracks`, and `TruthTrackRelations` (one `TrackMCParticleLink` per track,
 weight 1).
 
 ## Build (inside the mucoll-sim image)

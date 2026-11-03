@@ -18,7 +18,6 @@
 #include <Gaudi/Property.h>
 #include <GaudiKernel/SmartIF.h>
 
-#include <edm4hep/MCParticleCollection.h>
 #include <edm4hep/TrackCollection.h>
 #include <edm4hep/TrackMCParticleLinkCollection.h>
 #include <edm4hep/TrackerHitPlaneCollection.h>
@@ -31,8 +30,7 @@
 
 struct TruthTrackFinder final
     : k4FWCore::MultiTransformer<std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection>(
-          const edm4hep::TrackerHitPlaneCollection&, const edm4hep::TrackerHitSimTrackerHitLinkCollection&,
-          const edm4hep::MCParticleCollection&)> {
+          const edm4hep::TrackerHitPlaneCollection&, const edm4hep::TrackerHitSimTrackerHitLinkCollection&)> {
   TruthTrackFinder(const std::string& name, ISvcLocator* svcLoc);
 
   StatusCode initialize() override;
@@ -44,14 +42,14 @@ struct TruthTrackFinder final
   /// @param trackerHits  The digitized tracker hits (MergedTrackerHits: VXD, IT and OT hits in one collection).
   /// @param hitLinks     One link per (digitized hit, simulated hit) pair: getFrom() is the digitized hit
   ///                     (edm4hep::TrackerHit, i.e. an element of trackerHits), getTo() is the edm4hep::SimTrackerHit
-  ///                     it was made from. The SimTrackerHit gives the MCParticle (getParticle()).
-  /// @param mcParticles  The MCParticles that the SimTrackerHits point to. A hit is used only if its particle is in
-  ///                     this collection.
+  ///                     it was made from. The SimTrackerHit gives the MCParticle (getParticle()). The particle is
+  ///                     used as it is, so the output links point into whichever collection holds it (MCParticles
+  ///                     without overlay, the overlay's copy with overlay). A hit is used only if there is a particle
+  ///                     object behind the relation; for the overlay's BIB hits there is not, so they are skipped.
   /// @return             The fitted tracks, and one link per track: getFrom() is the track, getTo() the MCParticle.
   std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> operator()(
       const edm4hep::TrackerHitPlaneCollection& trackerHits,
-      const edm4hep::TrackerHitSimTrackerHitLinkCollection& hitLinks,
-      const edm4hep::MCParticleCollection& mcParticles) const override;
+      const edm4hep::TrackerHitSimTrackerHitLinkCollection& hitLinks) const override;
 
   /// @name Selection of the particles that get a track
   ///@{
@@ -100,7 +98,7 @@ private:
   mutable std::atomic<std::size_t> m_nLinks{0};                ///< hit links read
   mutable std::atomic<std::size_t> m_nHitsNotInFit{0};         ///< link to a hit without a source link
   mutable std::atomic<std::size_t> m_nSecondaryHits{0};        ///< hit skipped by SkipSecondaryHits
-  mutable std::atomic<std::size_t> m_nParticlesNotFound{0};    ///< hit from a particle not in the input (e.g. BIB)
+  mutable std::atomic<std::size_t> m_nParticlesNotFound{0};    ///< hit with no particle object (BIB with overlay)
   mutable std::atomic<std::size_t> m_nCandidates{0};           ///< MCParticles with at least one hit
   mutable std::atomic<std::size_t> m_nNeutral{0};              ///< candidates rejected as neutral
   mutable std::atomic<std::size_t> m_nLowPt{0};                ///< candidates rejected by MinTruePt

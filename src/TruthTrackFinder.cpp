@@ -47,8 +47,7 @@ DECLARE_COMPONENT(TruthTrackFinder)
 TruthTrackFinder::TruthTrackFinder(const std::string& name, ISvcLocator* svcLoc)
     : MultiTransformer(name, svcLoc,
                        {KeyValues("InputTrackerHitCollection", {"MergedTrackerHits"}),
-                        KeyValues("InputTrackerHitRelationCollection", {"MergedTrackerHitsRelations"}),
-                        KeyValues("InputMCParticleCollection", {"MCParticles"})},
+                        KeyValues("InputTrackerHitRelationCollection", {"MergedTrackerHitsRelations"})},
                        {KeyValues("OutputTrackCollection", {"TruthTracks"}),
                         KeyValues("OutputTrackRelationCollection", {"TruthTrackRelations"})}) {}
 
@@ -74,8 +73,8 @@ StatusCode TruthTrackFinder::initialize() {
 }
 
 std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> TruthTrackFinder::operator()(
-    const edm4hep::TrackerHitPlaneCollection& trackerHits, const edm4hep::TrackerHitSimTrackerHitLinkCollection& hitLinks,
-    const edm4hep::MCParticleCollection& mcParticles) const {
+    const edm4hep::TrackerHitPlaneCollection& trackerHits,
+    const edm4hep::TrackerHitSimTrackerHitLinkCollection& hitLinks) const {
   ++m_nEvents;
 
   // Default-construct ACTS contexts, as the CKF (CKFTrackingAlg) does. An empty geometry context means the nominal
@@ -103,21 +102,17 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
                           ACTSTracking::SeedHit{globalPos, std::hypot(globalPos.x(), globalPos.y()), sl});
       });
 
-  // Step 2: lookup table of the input MCParticles, ObjectID -> particle. A hit's particle is accepted only if it is in
-  // this collection. With BIB overlay the BIB particles are stored nowhere (their ObjectIDs carry collection ID
-  // ffffffff), so BIB hits are skipped here; with overlay the signal hits point to the overlay's copy of the signal
-  // particles, so the job must give that copy as input (see overlay_mc_particles in MAIAConfig).
-  std::unordered_map<podio::ObjectID, edm4hep::MCParticle> particleOf;
-  particleOf.reserve(mcParticles.size());
-  for (const auto& particle : mcParticles) {
-    particleOf.emplace(particle.getObjectID(), particle);
-  }
-
-  // Step 3: group the hits by MCParticle. Each link connects one reconstructed hit ("from") to the SimTrackerHit it
-  // was made from ("to"); a SimTrackerHit records exactly one MCParticle. The groups are kept in the order their
-  // particle is first seen, so the output order does not depend on hashing.
-  std::vector<HitGroup>                         groups;
-  std::unordered_map<podio::ObjectID, std::size_t> groupIndexOf;
+  // Step 2: group the hits by MCParticle. Each link connects one reconstructed hit ("from") to the SimTrackerHit it
+  // was made from ("to"); a SimTrackerHit records exactly one MCParticle, which is used as it is, so the output links
+  // point into whichever collection holds it: MCParticles without overlay, the overlay's copy of the signal particles
+  // (NewMCParticles) with overlay. With overlay, the BIB SimTrackerHits have no particle object behind their particle
+  // relation (isAvailable() is false), so BIB hits are skipped here.
+  // The particle's ObjectID is not used: with overlay, the copied signal particles carry collection ID ffffffff
+  // ("untracked") during the job and get their real ID only when written. The groups are therefore keyed by the
+  // particle handle (which compares the underlying object), and kept in the order their particle is first seen, so
+  // the output order does not depend on hashing.
+  std::vector<HitGroup>                                groups;
+  std::unordered_map<edm4hep::MCParticle, std::size_t> groupIndexOf;
   std::size_t nHitsNotInFit(0), nSecondaryHits(0), nParticlesNotFound(0);
 
   for (const auto& link : hitLinks) {
@@ -132,27 +127,27 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
       ++nSecondaryHits;
       continue;
     }
-    const auto particleIter = particleOf.find(simHit.getParticle().getObjectID());
-    if (particleIter == particleOf.end()) {
+    const edm4hep::MCParticle particle = simHit.getParticle();
+    if (!particle.isAvailable()) {
+      // No particle object behind the relation: the BIB particles with overlay
       ++nParticlesNotFound;
       continue;
     }
 
-    const auto [groupIter, isNew] = groupIndexOf.try_emplace(particleIter->first, groups.size());
+    const auto [groupIter, isNew] = groupIndexOf.try_emplace(particle, groups.size());
     if (isNew) {
-      groups.push_back(HitGroup{particleIter->second, {}});
+      groups.push_back(HitGroup{particle, {}});
     }
     groups[groupIter->second].hits.push_back(seedHitIter->second);
   }
 
   debug() << fmt::format("{} tracker hits, {} with a source link; {} hit links: {} to a hit without a source link, {} "
-                         "from secondaries skipped, {} from a particle not in the input MCParticles ({}); {} "
-                         "MCParticles with hits",
+                         "from secondaries skipped, {} with no particle object (BIB); {} MCParticles with hits",
                          trackerHits.size(), seedHitOf.size(), hitLinks.size(), nHitsNotInFit, nSecondaryHits,
-                         nParticlesNotFound, mcParticles.size(), groups.size())
+                         nParticlesNotFound, groups.size())
           << endmsg;
 
-  // Step 4: fit each group with the Kalman fitter. Unlike the CKF, no hit is rejected by a chi2 cut: every hit of the
+  // Step 3: fit each group with the Kalman fitter. Unlike the CKF, no hit is rejected by a chi2 cut: every hit of the
   // group is given to the fit.
   Acts::MagneticFieldProvider::Cache magCache = m_actsGeoSvc->magneticField()->makeCache(magCtx);
 
@@ -266,7 +261,7 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
 
 StatusCode TruthTrackFinder::finalize() {
   info() << fmt::format("Summary over {} events: {} hit links ({} to a hit without a source link, {} from secondaries "
-                        "skipped, {} from a particle not in the input MCParticles); {} MCParticles with hits -> {} "
+                        "skipped, {} with no particle object (BIB)); {} MCParticles with hits -> {} "
                         "tracks (rejected: {} neutral, {} below MinTruePt, {} below MinHitsPerTrack, {} start-parameter "
                         "failures, {} fit failures)",
                         m_nEvents.load(), m_nLinks.load(), m_nHitsNotInFit.load(), m_nSecondaryHits.load(),
