@@ -22,8 +22,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -69,6 +71,31 @@ StatusCode TruthTrackFinder::initialize() {
     error() << "MinHitsPerTrack must be at least 3, got " << m_minHitsPerTrk.value() << endmsg;
     return StatusCode::FAILURE;
   }
+
+  if (m_fitMode.value() == "CKF") {
+    m_useCKF = true;
+    // Built once with the same configuration fields as CKFTrackingAlg; the reference surface for the AtIP state is
+    // the default perigee at the origin
+    m_ckfRunner.emplace(*m_actsGeoSvc,
+                        ACTSTracking::CKFRunner::Config{.chi2CutOff            = m_CKF_chi2CutOff,
+                                                        .numMeasurementsCutOff = m_CKF_numMeasurementsCutOff,
+                                                        .chi2CutOffOutlier     = m_CKF_chi2CutOffOutlier,
+                                                        .propagateBackward     = m_propagateBackward,
+                                                        .extrapolateToCalo     = m_extrapolateToCalo,
+                                                        .addEndcapCaloState    = m_addEndcapCaloState,
+                                                        .useBranchStopper      = m_useBranchStopper,
+                                                        .bsMaxHoles            = m_bsMaxHoles,
+                                                        .bsMaxOutliers         = m_bsMaxOutliers,
+                                                        .bsMinMeasurements     = m_bsMinMeasurements,
+                                                        .bsPtMin               = m_bsPtMin,
+                                                        .bsPtMinMeasurements   = m_bsPtMinMeasurements});
+  } else if (m_fitMode.value() == "KF") {
+    m_useCKF = false;
+  } else {
+    error() << "FitMode must be \"CKF\" or \"KF\", got \"" << m_fitMode.value() << "\"" << endmsg;
+    return StatusCode::FAILURE;
+  }
+  info() << "FitMode " << m_fitMode.value() << endmsg;
   return StatusCode::SUCCESS;
 }
 
@@ -157,14 +184,18 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
     bzTesla = field.value().z() / Acts::UnitConstants::T;
   }
 
-  const ACTSTracking::KFRunner kfRunner(*m_actsGeoSvc, geoCtx, magCtx, calCtx, measurements, hitContainer,
-                                        {.propagateBackward  = m_propagateBackward,
-                                         .extrapolateToCalo  = m_extrapolateToCalo,
-                                         .addEndcapCaloState = m_addEndcapCaloState});
+  // The Kalman fitter binds this event's measurements, so it is built per event (only for FitMode "KF")
+  std::optional<ACTSTracking::KFRunner> kfRunner;
+  if (!m_useCKF) {
+    kfRunner.emplace(*m_actsGeoSvc, geoCtx, magCtx, calCtx, measurements, hitContainer,
+                     ACTSTracking::KFRunner::Config{.propagateBackward  = m_propagateBackward,
+                                                   .extrapolateToCalo  = m_extrapolateToCalo,
+                                                   .addEndcapCaloState = m_addEndcapCaloState});
+  }
 
   edm4hep::TrackCollection               tracks;
   edm4hep::TrackMCParticleLinkCollection trackLinks;
-  std::size_t nNeutral(0), nLowPt(0), nTooFewHits(0), nSeedFailed(0), nFitFailed(0);
+  std::size_t nNeutral(0), nLowPt(0), nTooFewHits(0), nSeedFailed(0), nFitFailed(0), nCkfCandidates(0);
 
   for (auto& group : groups) {
     const edm4hep::MCParticle& particle = group.particle;
@@ -185,8 +216,9 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
     }
 
     // Order by transverse radius, as k4ActsTracking's collectSeedHits does. The start parameters come from the
-    // innermost, middle and outermost hit. If two hits of the particle are on the same sensor surface, the Kalman
-    // fitter uses only the first one it is given, i.e. the one at smaller radius.
+    // innermost, middle and outermost hit; both fits start on the innermost hit's surface. FitMode "KF": if two hits
+    // of the particle are on the same sensor surface, the Kalman fitter uses only the first one it is given, i.e. the
+    // one at smaller radius. FitMode "CKF": the order does not matter, the CKF looks the hits up by surface.
     std::sort(group.hits.begin(), group.hits.end(),
               [](const ACTSTracking::SeedHit& a, const ACTSTracking::SeedHit& b) { return a.r < b.r; });
 
@@ -201,18 +233,54 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
       continue;
     }
 
-    std::vector<Acts::SourceLink> groupSourceLinks;
-    groupSourceLinks.reserve(group.hits.size());
-    for (const ACTSTracking::SeedHit& hit : group.hits) {
-      groupSourceLinks.emplace_back(hit.sl);
+    std::optional<edm4hep::MutableTrack> track;
+    std::size_t                          nCandidatesThisParticle(0);
+    if (m_useCKF) {
+      // The CKF looks up the hits on each surface it crosses in a source-link container (sorted by surface). It is
+      // given a container with only this particle's hits, so it can only choose among them, and with the one seed
+      // from the start parameters. The measurements and hitContainer are the whole event's; the source links index
+      // into them.
+      ACTSTracking::SourceLinkContainer particleSourceLinks;
+      particleSourceLinks.reserve(group.hits.size());
+      for (const ACTSTracking::SeedHit& hit : group.hits) {
+        particleSourceLinks.insert(hit.sl);
+      }
+
+      // The CKF can return several candidates for one seed (it branches when more than one of the particle's hits on
+      // a surface passes the chi2 cut). They are collected in a scratch collection; the one with the most hits, then
+      // the lowest chi2, is kept (the ordering ACTSDuplicateRemoval uses) and copied into the output.
+      edm4hep::TrackCollection candidates;
+      std::mutex               candidatesMutex;  // findTracks locks it to add to the collection
+      m_ckfRunner->findTracks(*this, measurements, particleSourceLinks, hitContainer,
+                              std::vector<Acts::BoundTrackParameters>{*startParams}, magCache, candidates,
+                              candidatesMutex, &m_caloMonitor);
+      nCandidatesThisParticle = candidates.size();
+      nCkfCandidates += candidates.size();
+      if (!candidates.empty()) {
+        const auto best = std::min_element(candidates.begin(), candidates.end(),
+                                           [](const edm4hep::Track& a, const edm4hep::Track& b) {
+                                             if (a.getTrackerHits().size() != b.getTrackerHits().size()) {
+                                               return a.getTrackerHits().size() > b.getTrackerHits().size();
+                                             }
+                                             return a.getChi2() < b.getChi2();
+                                           });
+        // clone() copies the track's data, hits and track states into a new track that belongs to no collection yet
+        track = (*best).clone();
+      }
+    } else {
+      std::vector<Acts::SourceLink> groupSourceLinks;
+      groupSourceLinks.reserve(group.hits.size());
+      for (const ACTSTracking::SeedHit& hit : group.hits) {
+        groupSourceLinks.emplace_back(hit.sl);
+      }
+      track = kfRunner->fit(*this, groupSourceLinks, *startParams, magCache, &m_caloMonitor);
     }
 
-    std::optional<edm4hep::MutableTrack> track =
-        kfRunner.fit(*this, groupSourceLinks, *startParams, magCache, &m_caloMonitor);
     if (!track) {
       ++nFitFailed;
-      debug() << fmt::format("MCParticle {} (PDG {}, pT {:.3f} GeV, {} hits): Kalman fit failed",
-                             particle.getObjectID().index, particle.getPDG(), truePt, group.hits.size())
+      debug() << fmt::format("MCParticle {} (PDG {}, pT {:.3f} GeV, {} hits): {}", particle.getObjectID().index,
+                             particle.getPDG(), truePt, group.hits.size(),
+                             m_useCKF ? "CKF found no track" : "Kalman fit failed")
               << endmsg;
       continue;
     }
@@ -232,16 +300,18 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
         }
       }
       debug() << fmt::format("MCParticle {} (PDG {}): true pT {:.3f} GeV, fitted pT {:.3f} GeV; {} hits given, {} on "
-                             "the track; chi2/ndf {:.1f}/{}",
+                             "the track, {} holes; chi2/ndf {:.1f}/{}{}",
                              particle.getObjectID().index, particle.getPDG(), truePt, fittedPt, group.hits.size(),
-                             track->getTrackerHits().size(), track->getChi2(), track->getNdf())
+                             track->getTrackerHits().size(), track->getNholes(), track->getChi2(), track->getNdf(),
+                             m_useCKF ? fmt::format("; {} CKF candidates", nCandidatesThisParticle) : "")
               << endmsg;
     }
   }
 
   debug() << fmt::format("{} tracks from {} MCParticles with hits (rejected: {} neutral, {} below MinTruePt, {} below "
-                         "MinHitsPerTrack, {} start-parameter failures, {} fit failures)",
-                         tracks.size(), groups.size(), nNeutral, nLowPt, nTooFewHits, nSeedFailed, nFitFailed)
+                         "MinHitsPerTrack, {} start-parameter failures, {} fit failures); {} CKF candidates",
+                         tracks.size(), groups.size(), nNeutral, nLowPt, nTooFewHits, nSeedFailed, nFitFailed,
+                         nCkfCandidates)
           << endmsg;
 
   m_nLinks += hitLinks.size();
@@ -254,6 +324,7 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
   m_nTooFewHits += nTooFewHits;
   m_nSeedFailed += nSeedFailed;
   m_nFitFailed += nFitFailed;
+  m_nCkfCandidates += nCkfCandidates;
   m_nTracks += tracks.size();
 
   return std::make_tuple(std::move(tracks), std::move(trackLinks));
@@ -263,10 +334,11 @@ StatusCode TruthTrackFinder::finalize() {
   info() << fmt::format("Summary over {} events: {} hit links ({} to a hit without a source link, {} from secondaries "
                         "skipped, {} with no particle object (BIB)); {} MCParticles with hits -> {} "
                         "tracks (rejected: {} neutral, {} below MinTruePt, {} below MinHitsPerTrack, {} start-parameter "
-                        "failures, {} fit failures)",
-                        m_nEvents.load(), m_nLinks.load(), m_nHitsNotInFit.load(), m_nSecondaryHits.load(),
-                        m_nParticlesNotFound.load(), m_nCandidates.load(), m_nTracks.load(), m_nNeutral.load(),
-                        m_nLowPt.load(), m_nTooFewHits.load(), m_nSeedFailed.load(), m_nFitFailed.load())
+                        "failures, {} fit failures); {} CKF candidates",
+                        m_nEvents.load(), m_fitMode.value(), m_nLinks.load(), m_nHitsNotInFit.load(),
+                        m_nSecondaryHits.load(), m_nParticlesNotFound.load(), m_nCandidates.load(), m_nTracks.load(),
+                        m_nNeutral.load(), m_nLowPt.load(), m_nTooFewHits.load(), m_nSeedFailed.load(),
+                        m_nFitFailed.load(), m_nCkfCandidates.load())
          << endmsg;
   if (m_extrapolateToCalo) {
     info() << m_caloMonitor.summary() << endmsg;

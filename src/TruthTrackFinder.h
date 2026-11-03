@@ -1,15 +1,19 @@
 #pragma once
 
 // Truth-based track finding: the tracker hits are grouped by the MCParticle that made them (instead of by a pattern
-// recognition such as the CKF), and each group is fitted with the ACTS Kalman fitter of k4ActsTracking
-// (ACTSTracking::KFRunner). KFRunner uses the same propagator, material, field, measurement calibration, Kalman update
-// and edm4hep conversion as the CKF (ACTSTracking::CKFRunner); the difference is that the CKF chooses, surface by
-// surface, which hit to add (and rejects hits with chi2 above its cut), while KFRunner fits every hit it is given. The
+// recognition such as the CKF), and each group is turned into a track in one of two ways (property FitMode):
+//  * "CKF" (default): the Combinatorial Kalman Filter of k4ActsTracking (ACTSTracking::CKFRunner), as used by the
+//    standard CKF tracking, but given only the hits of this one particle. Surface by surface it adds a hit only if
+//    its chi2 is below CKF_Chi2CutOff (between that and CKF_Chi2CutOffOutlier it is kept as an outlier, above as a
+//    hole), so it applies the same hit rejection as the standard CKF.
+//  * "KF": the plain Kalman fitter of k4ActsTracking (ACTSTracking::KFRunner), which fits every hit it is given.
+// Both use the same propagator, material, field, measurement calibration, Kalman update and edm4hep conversion. The
 // fitted momentum therefore still includes the hit resolution, the material and the field, but no wrong, missing,
-// duplicate or fake tracks.
+// duplicate or fake tracks. To run both fits, configure two instances with different output collections.
 
 #include <k4FWCore/Transformer.h>
 
+#include <k4ActsTracking/CKFRunner.hxx>
 #include <k4ActsTracking/IActsGeoSvc.h>
 #include <k4ActsTracking/RunnerCommon.hxx>
 
@@ -25,6 +29,9 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <tuple>
 
@@ -64,7 +71,33 @@ struct TruthTrackFinder final
              "hit lies near, but not on, the ancestor's path."};
   ///@}
 
-  /// @name Kalman-fit configuration, the same properties and defaults as the CKF (CKFTrackingAlg)
+  Gaudi::Property<std::string> m_fitMode{
+      this, "FitMode", "CKF",
+      "How each particle's hits are turned into a track: \"CKF\" (Combinatorial Kalman Filter over the particle's hits, "
+      "with the CKF's chi2 hit rejection) or \"KF\" (Kalman fit of every hit)."};
+
+  /// @name CKF configuration (FitMode "CKF"), the same properties and defaults as CKFTrackingAlg
+  ///@{
+  Gaudi::Property<double>  m_CKF_chi2CutOff{this, "CKF_Chi2CutOff", 15, "Maximum local chi2 contribution."};
+  Gaudi::Property<int32_t> m_CKF_numMeasurementsCutOff{this, "CKF_NumMeasurementsCutOff", 10,
+                                                       "Maximum measurements on a single surface."};
+  Gaudi::Property<double>  m_CKF_chi2CutOffOutlier{
+      this, "CKF_Chi2CutOffOutlier", std::numeric_limits<double>::max(),
+      "Maximum local chi2 for a failing hit to be kept as an outlier; above this it becomes a hole."};
+  Gaudi::Property<bool>    m_useBranchStopper{this, "UseBranchStopper", false, "Enable the CKF branch stopper."};
+  Gaudi::Property<int>     m_bsMaxHoles{this, "BranchStopper_MaxHoles", 2, "Stop a branch above this many holes."};
+  Gaudi::Property<int>     m_bsMaxOutliers{this, "BranchStopper_MaxOutliers", 2,
+                                       "Stop a branch above this many outliers."};
+  Gaudi::Property<int>     m_bsMinMeasurements{
+      this, "BranchStopper_MinMeasurements", 6,
+      "When stopping, keep the branch if it has at least this many measurements, otherwise drop it."};
+  Gaudi::Property<double>  m_bsPtMin{this, "BranchStopper_PtMin", 0.0,
+                                    "Drop a branch with |pT| (GeV) below this; <=0 disables."};
+  Gaudi::Property<int>     m_bsPtMinMeasurements{this, "BranchStopper_PtMinMeasurements", 3,
+                                             "Minimum measurements before the pT branch stop is applied."};
+  ///@}
+
+  /// @name Kalman-fit configuration (both modes), the same properties and defaults as the CKF (CKFTrackingAlg)
   ///@{
   Gaudi::Property<bool>   m_propagateBackward{this, "PropagateBackward", false, "Extrapolates tracks towards beamline."};
   Gaudi::Property<bool>   m_extrapolateToCalo{
@@ -89,6 +122,13 @@ struct TruthTrackFinder final
 private:
   SmartIF<IActsGeoSvc> m_actsGeoSvc{nullptr};
 
+  /// True for FitMode "CKF", false for "KF"; set in initialize()
+  bool m_useCKF{true};
+
+  /// The CKF, built once in initialize() for FitMode "CKF" (as CKFTrackingAlg does). It holds no event data, so the
+  /// concurrent operator() calls can share it.
+  std::optional<ACTSTracking::CKFRunner> m_ckfRunner{};
+
   /// Calorimeter-face extrapolation monitoring, updated by the per-event KFRunner and summarized in finalize().
   ACTSTracking::CaloExtrapMonitor m_caloMonitor{};
 
@@ -104,6 +144,7 @@ private:
   mutable std::atomic<std::size_t> m_nLowPt{0};                ///< candidates rejected by MinTruePt
   mutable std::atomic<std::size_t> m_nTooFewHits{0};           ///< candidates rejected by MinHitsPerTrack
   mutable std::atomic<std::size_t> m_nSeedFailed{0};           ///< start-parameter estimation failed
-  mutable std::atomic<std::size_t> m_nFitFailed{0};            ///< Kalman fit failed
+  mutable std::atomic<std::size_t> m_nFitFailed{0};            ///< no track: Kalman fit failed / CKF found none
+  mutable std::atomic<std::size_t> m_nCkfCandidates{0};        ///< CKF candidates found (one is kept per particle)
   mutable std::atomic<std::size_t> m_nTracks{0};               ///< tracks written
 };
