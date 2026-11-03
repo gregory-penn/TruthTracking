@@ -5,6 +5,8 @@
 
 #include <k4FWCore/GaudiChecks.h>
 
+#include <GaudiKernel/GaudiException.h>
+
 #include <Acts/EventData/SourceLink.hpp>
 #include <Acts/Geometry/GeometryContext.hpp>
 #include <Acts/MagneticField/MagneticFieldContext.hpp>
@@ -140,13 +142,26 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
   // the output order does not depend on hashing.
   std::vector<HitGroup>                                groups;
   std::unordered_map<edm4hep::MCParticle, std::size_t> groupIndexOf;
-  std::size_t nHitsNotInFit(0), nSecondaryHits(0), nParticlesNotFound(0);
+  std::size_t nHitsNotInFit(0), nHitsNotInInput(0), nSecondaryHits(0), nParticlesNotFound(0);
+
+  // Every input hit, to tell the two reasons a link's hit can lack a source link apart (see below)
+  std::unordered_set<edm4hep::TrackerHit> inputHits;
+  inputHits.reserve(trackerHits.size());
+  for (const auto& hit : trackerHits) {
+    inputHits.insert(edm4hep::TrackerHit(hit));
+  }
 
   for (const auto& link : hitLinks) {
     const auto seedHitIter = seedHitOf.find(link.getFrom());
     if (seedHitIter == seedHitOf.end()) {
-      // Not in the input hit collection, or no ACTS surface for its cellID
-      ++nHitsNotInFit;
+      if (inputHits.contains(link.getFrom())) {
+        // In the input hit collection, but prepareTrackerHits refused it (no ACTS surface for its cellID, or more
+        // than 0.5 um off its surface). prepareTrackerHits already printed a warning, and the CKF loses it too.
+        ++nHitsNotInFit;
+      } else {
+        // Not in the input hit collection at all: the hit and relation collections do not belong together
+        ++nHitsNotInInput;
+      }
       continue;
     }
     const edm4hep::SimTrackerHit simHit = link.getTo();
@@ -174,8 +189,17 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
                          nParticlesNotFound, groups.size())
           << endmsg;
 
-  // Step 3: fit each group with the Kalman fitter. Unlike the CKF, no hit is rejected by a chi2 cut: every hit of the
-  // group is given to the fit.
+  // A link to a hit that is not in the input hit collection can only come from a configuration error (e.g. the
+  // relations of the coned hits given together with the un-coned hits), so the job is stopped.
+  if (nHitsNotInInput > 0) {
+    throw GaudiException(fmt::format("{} of {} hit links point to a hit that is not in the input tracker-hit collection "
+                                     "'{}': the hit collection and the relation collection '{}' do not belong together",
+                                     nHitsNotInInput, hitLinks.size(), inputLocations(0).front(),
+                                     inputLocations(1).front()),
+                         name(), StatusCode::FAILURE);
+  }
+
+  // Step 3: turn each group into a track, with the CKF (FitMode "CKF") or the Kalman fitter (FitMode "KF")
   Acts::MagneticFieldProvider::Cache magCache = m_actsGeoSvc->magneticField()->makeCache(magCtx);
 
   // Bz at the origin, only for the fitted-pT debug print
@@ -331,8 +355,8 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackMCParticleLinkCollection> Tru
 }
 
 StatusCode TruthTrackFinder::finalize() {
-  info() << fmt::format("Summary over {} events: {} hit links ({} to a hit without a source link, {} from secondaries "
-                        "skipped, {} with no particle object (BIB)); {} MCParticles with hits -> {} "
+  info() << fmt::format("Summary over {} events (FitMode {}): {} hit links ({} to a hit without a source link, {} from "
+                        "secondaries skipped, {} with no particle object (BIB)); {} MCParticles with hits -> {} "
                         "tracks (rejected: {} neutral, {} below MinTruePt, {} below MinHitsPerTrack, {} start-parameter "
                         "failures, {} fit failures); {} CKF candidates",
                         m_nEvents.load(), m_fitMode.value(), m_nLinks.load(), m_nHitsNotInFit.load(),
